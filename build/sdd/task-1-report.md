@@ -69,4 +69,19 @@ Docker engine pipe 접근 권한이 없어 실제 이미지 build, Nginx runtime
 - Actuator, Redis, Worker, 의존성, migration, 애플리케이션 코드를 추가하지 않았다.
 - 생성 키·원시 결과·로그·볼륨은 `.gitignore`와 `.dockerignore`에서 제외했다.
 - base/dual Compose 정적 검증과 전체 Gradle 테스트를 실행했으며, 컨테이너는 시작하지 않았다.
-- 커밋 SHA는 본 보고서를 포함한 Git 객체가 생성된 뒤 확정되므로 컨트롤러 전달 상태의 최종 SHA를 기준으로 한다.
+- 최초 환경 추가 커밋 SHA: `3b65376dcb05f44bf37ae8d5ddcafd2ecd29f85d`
+
+## 리뷰 수정 검증
+
+리뷰 1차 수정으로 `.dockerignore`에 `load-tests/**/volumes`를 추가했다.
+
+```powershell
+$dockerIgnore = Get-Content '.dockerignore'; $volumePath = 'load-tests/issue-57/volumes/postgres-data/PG_VERSION'; if ($dockerIgnore -notcontains 'load-tests/**/volumes') { throw 'Docker build context does not exclude local volumes' }; if ($volumePath -notmatch '^load-tests/.+/volumes(?:/|$)') { throw 'Focused volume path does not match the Docker ignore rule' }; git -c safe.directory='C:/Projects/jariyo-backend/build/worktrees/chore-reservation-conflict-load-test' check-ignore -q $volumePath; if ($LASTEXITCODE -ne 0) { throw 'Git does not ignore the local volume path' }; if ($dockerIgnore -contains 'load-tests/issue-57/Dockerfile') { throw 'Dockerfile must remain in the build context' }; Write-Output 'PASS: local volume path is ignored by Git and excluded from the Docker build context; Dockerfile remains included'
+```
+
+정확한 출력:
+
+```text
+warning: unable to access 'C:\Users\madog/.config/git/ignore': Permission denied
+PASS: local volume path is ignored by Git and excluded from the Docker build context; Dockerfile remains included
+```

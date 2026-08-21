@@ -4,3 +4,4 @@ build
 load-tests/**/keys
 load-tests/**/logs
 load-tests/**/results
+load-tests/**/volumes
