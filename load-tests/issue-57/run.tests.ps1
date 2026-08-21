@@ -105,4 +105,9 @@ Assert-True (-not $pem.Public.Contains("`n")) 'public PEM must not contain real 
 Assert-True (-not $pem.Private.Contains("`n")) 'private PEM must not contain real newlines'
 Assert-True (-not $pem.Public.Contains('PRIVATE KEY')) 'public material must not contain private key data'
 
-Write-Output 'PASS: 7 focused runner behavior groups'
+$scenarioSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'reservation-conflict.js') -Raw
+Assert-True ($scenarioSource.Contains('const expectedReservationStatuses = http.expectedStatuses(201, 409);')) 'reservation status accounting must use a k6 expectedStatuses callback'
+Assert-True ($scenarioSource.Contains('responseCallback: expectedReservationStatuses')) 'reservation requests must pass the k6-compatible response callback object'
+Assert-True (-not $scenarioSource.Contains('function expectedReservationResponse(')) 'a JavaScript predicate is not a valid k6 responseCallback'
+
+Write-Output 'PASS: 8 focused runner behavior groups'

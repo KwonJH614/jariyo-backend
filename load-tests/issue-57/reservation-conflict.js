@@ -22,6 +22,7 @@ const SIGN_UP_BATCH_SIZE = 10;
 const BASE_MAX_DURATION = '30s';
 const STRESSED_START_TIME = '35s';
 const JSON_HEADERS = { 'Content-Type': 'application/json' };
+const expectedReservationStatuses = http.expectedStatuses(201, 409);
 
 const setupFailures = new Counter('setup_failures');
 const reservationSuccess = new Counter('reservation_success');
@@ -129,7 +130,7 @@ function reservationRequest(token, key, body, scenario, attempt) {
 			'Idempotency-Key': key,
 		},
 		tags,
-		responseCallback: expectedReservationResponse,
+		responseCallback: expectedReservationStatuses,
 	});
 	const validConflict = isValidConflict(response);
 	const semanticSuccess = response.status === 201;
@@ -152,10 +153,6 @@ function reservationRequest(token, key, body, scenario, attempt) {
 		'reservation response is 201 or valid slot conflict': () => semanticExpected,
 	});
 	return response;
-}
-
-function expectedReservationResponse(response) {
-	return response.status === 201 || isValidConflict(response);
 }
 
 function isValidConflict(response) {
