@@ -122,3 +122,35 @@ BUILD SUCCESSFUL in 2s
 - setup HTTP에는 `phase=setup`만 태그를 붙이고 예약 사용자 정의 지표에는 추가하지 않았다. 예약 초기/재시도 HTTP에는 raw JSON RPS 분리용 `scenario`, `attempt` 태그를 붙였다.
 - 사용자 정의 Counter와 tagged threshold는 Base 1/19, Stressed initial 1/99, retry 0/99의 정확한 cardinality를 강제한다. `handleSummary`는 machine-readable JSON, 시나리오 카운트·p95/p99·5xx/unexpected·threshold pass/fail을 담는 Markdown을 출력한다.
 - 애플리케이션, Compose, fixture, 의존성, API, schema는 변경하지 않았다. `k6 inspect` RED/GREEN 및 `./gradlew.bat test` 성공을 확인했다.
+
+## 리뷰 수정 1차
+
+- 원 Task 2 커밋 SHA: `2e45485956e62bf9eea6d55c24a5d65bc53c046b`
+- `options.summaryTrendStats`에 `p(95)`, `p(99)`를 명시해 `handleSummary()`가 사용하는 Trend 값이 항상 k6 summary data에 포함되도록 했다.
+- timestamp 파서는 정규식만 통과시키는 `Date.parse()` 대신 월별 일수·윤년·시/분/초·Java `ZoneOffset` 호환 최대 `±18:00`를 검증한다. fractional second는 최대 9자리 nanosecond로 보존하고, offset을 뺀 instant의 초·nanosecond를 비교해 표현이 달라도 같은 instant인 두 슬롯을 거절한다.
+
+### 리뷰 수정 검증 명령과 출력
+
+```powershell
+k6 inspect -e BASE_START_AT=2026-09-07T09:00:00+09:00 -e STRESSED_START_AT=2026-09-07T10:00:00+09:00 -e RESULT_DIR=load-tests/issue-57/results/inspect load-tests/issue-57/reservation-conflict.js
+k6 inspect -e BASE_START_AT=2026-09-07T09:00:00+09:00 -e STRESSED_START_AT=2026-09-07T00:00:00Z load-tests/issue-57/reservation-conflict.js
+k6 inspect -e BASE_START_AT=2026-02-30T09:00:00+09:00 -e STRESSED_START_AT=2026-09-07T10:00:00+09:00 load-tests/issue-57/reservation-conflict.js
+```
+
+```text
+valid inspect: exit 0
+"summaryTrendStats": [
+  "p(95)",
+  "p(99)"
+]
+
+same-instant inspect: exit 107
+Error: BASE_START_AT and STRESSED_START_AT must be different slots
+
+invalid-date inspect: exit 107
+Error: BASE_START_AT must be an ISO-8601 offset timestamp
+
+valid=0 sameInstant=107 invalidDate=107
+```
+
+서로 다른 문자열 `2026-09-07T09:00:00+09:00`와 `2026-09-07T00:00:00Z`는 같은 instant이므로 거절됐고, 존재하지 않는 `2026-02-30`도 거절됐다.

@@ -4,11 +4,13 @@ import { Counter, Rate, Trend } from 'k6/metrics';
 import execution from 'k6/execution';
 
 const BASE_URL = __ENV.BASE_URL || 'http://localhost:8080';
-const BASE_START_AT = requireOffsetTimestamp('BASE_START_AT');
-const STRESSED_START_AT = requireOffsetTimestamp('STRESSED_START_AT');
+const BASE_START = requireOffsetTimestamp('BASE_START_AT');
+const STRESSED_START = requireOffsetTimestamp('STRESSED_START_AT');
+const BASE_START_AT = BASE_START.value;
+const STRESSED_START_AT = STRESSED_START.value;
 const RESULT_DIR = (__ENV.RESULT_DIR || 'load-tests/issue-57/results/manual').replace(/\/$/, '');
 
-if (BASE_START_AT === STRESSED_START_AT) {
+if (BASE_START.epochSeconds === STRESSED_START.epochSeconds && BASE_START.nanoseconds === STRESSED_START.nanoseconds) {
 	throw new Error('BASE_START_AT and STRESSED_START_AT must be different slots');
 }
 
@@ -30,6 +32,7 @@ const baseReservationDuration = new Trend('base_reservation_duration');
 const stressedReservationDuration = new Trend('stressed_reservation_duration');
 
 export const options = {
+	summaryTrendStats: ['p(95)', 'p(99)'],
 	scenarios: {
 		base: {
 			executor: 'per-vu-iterations',
@@ -191,11 +194,42 @@ function signUpAccessToken(response) {
 
 function requireOffsetTimestamp(name) {
 	const value = __ENV[name];
-	if (!value || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value)
-		|| Number.isNaN(Date.parse(value))) {
+	const match = value && /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|([+-])(\d{2}):(\d{2}))$/.exec(value);
+	if (!match) {
 		throw new Error(`${name} must be an ISO-8601 offset timestamp`);
 	}
-	return value;
+
+	const year = Number(match[1]);
+	const month = Number(match[2]);
+	const day = Number(match[3]);
+	const hour = Number(match[4]);
+	const minute = Number(match[5]);
+	const second = Number(match[6]);
+	const offsetHour = match[10] ? Number(match[10]) : 0;
+	const offsetMinute = match[11] ? Number(match[11]) : 0;
+	if (month < 1 || month > 12 || day < 1 || day > daysInMonth(year, month)
+		|| hour > 23 || minute > 59 || second > 59 || offsetHour > 18
+		|| (offsetHour === 18 && offsetMinute !== 0) || offsetMinute > 59) {
+		throw new Error(`${name} must be an ISO-8601 offset timestamp`);
+	}
+
+	const local = new Date(0);
+	local.setUTCFullYear(year, month - 1, day);
+	local.setUTCHours(hour, minute, second, 0);
+	const offsetSign = match[9] === '-' ? -1 : 1;
+	const offsetSeconds = offsetSign * (offsetHour * 60 + offsetMinute) * 60;
+	return {
+		value,
+		epochSeconds: Math.floor(local.getTime() / 1000) - offsetSeconds,
+		nanoseconds: Number(((match[7] || '') + '000000000').slice(0, 9)),
+	};
+}
+
+function daysInMonth(year, month) {
+	if (month === 2) {
+		return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+	}
+	return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 export function handleSummary(data) {
