@@ -1,0 +1,61 @@
+name: jariyo-issue-57
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-jariyo}
+      POSTGRES_USER: ${POSTGRES_USER:-jariyo}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-jariyo}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    volumes:
+      - issue-57-postgres-data:/var/lib/postgresql/data
+      - ./fixture.sql:/fixtures/issue-57.sql:ro
+    cpus: "1.0"
+    mem_limit: 2g
+
+  api-1:
+    build:
+      context: ../..
+      dockerfile: load-tests/issue-57/Dockerfile
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-jariyo}
+      DB_USERNAME: ${POSTGRES_USER:-jariyo}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-jariyo}
+      JWT_ISSUER: ${JWT_ISSUER:-https://api.jariyo.local}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-jariyo-web}
+      JWT_PUBLIC_KEY: ${JWT_PUBLIC_KEY:-}
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:8080/api/v1/stores || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+    cpus: "1.0"
+    mem_limit: 2g
+
+  nginx:
+    image: nginx:1.27-alpine
+    depends_on:
+      api-1:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/nginx.conf:ro
+    cpus: "0.25"
+    mem_limit: 256m
+
+volumes:
+  issue-57-postgres-data:
+    name: jariyo-issue-57-postgres-data
+    driver: local

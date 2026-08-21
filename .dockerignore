@@ -1,0 +1,6 @@
+.git
+.gradle
+build
+load-tests/**/keys
+load-tests/**/logs
+load-tests/**/results
