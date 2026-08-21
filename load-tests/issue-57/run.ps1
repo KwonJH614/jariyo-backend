@@ -1,0 +1,435 @@
+[CmdletBinding()]
+param(
+	[ValidateSet('Single', 'Dual', 'All')]
+	[string] $Mode = 'All'
+)
+
+$ErrorActionPreference = 'Stop'
+$script:Issue57ProjectName = 'jariyo-issue-57'
+$script:Issue57StoreId = '00000000-0000-7000-8000-000000000001'
+$script:Issue57StaffId = '00000000-0000-7000-8000-000000000301'
+
+function Get-Issue57ComposeFiles {
+	param([ValidateSet('Single', 'Dual')] [string] $Mode)
+
+	$files = @(Join-Path $PSScriptRoot 'compose.yaml')
+	if ($Mode -eq 'Dual') {
+		$files += Join-Path $PSScriptRoot 'compose.dual.yaml'
+	}
+	return $files
+}
+
+function Get-Issue57ComposeArguments {
+	param([ValidateSet('Single', 'Dual')] [string] $Mode)
+
+	$arguments = @('compose', '--project-name', $script:Issue57ProjectName)
+	foreach ($file in @(Get-Issue57ComposeFiles -Mode $Mode)) {
+		$arguments += @('-f', $file)
+	}
+	return $arguments
+}
+
+function Get-Issue57CleanupArguments {
+	param([ValidateSet('Single', 'Dual')] [string] $Mode)
+
+	return @(Get-Issue57ComposeArguments -Mode $Mode) + @('down', '-v', '--remove-orphans')
+}
+
+function Get-Issue57Slots {
+	param([DateTimeOffset] $Now = [DateTimeOffset]::Now)
+
+	$offset = [TimeSpan]::FromHours(9)
+	$date = $Now.ToOffset($offset).Date.AddDays(2)
+	return [pscustomobject]@{
+		Base = ([DateTimeOffset]::new($date.AddHours(14), $offset)).ToString("yyyy-MM-dd'T'HH:mm:sszzz")
+		Stressed = ([DateTimeOffset]::new($date.AddHours(15), $offset)).ToString("yyyy-MM-dd'T'HH:mm:sszzz")
+	}
+}
+
+function Get-Issue57PeakRps {
+	param([Parameter(Mandatory)] [string] $RawJsonPath)
+
+	$buckets = @{}
+	Get-Content -LiteralPath $RawJsonPath | ForEach-Object {
+		if ([string]::IsNullOrWhiteSpace($_)) {
+			return
+		}
+		$point = $_ | ConvertFrom-Json
+		if ($point.type -ne 'Point' -or
+			$point.metric -ne 'http_reqs' -or
+			$point.data.tags.attempt -ne 'initial' -or
+			$point.data.tags.scenario -notin @('base', 'stressed')) {
+			return
+		}
+		$second = ([DateTimeOffset]::Parse($point.data.time)).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+		$key = "$($point.data.tags.scenario)|$second"
+		$buckets[$key] = [double]($buckets[$key] ?? 0) + [double]$point.data.value
+	}
+
+	$result = [ordered]@{}
+	foreach ($scenario in @('base', 'stressed')) {
+		$peak = $buckets.GetEnumerator() |
+			Where-Object { $_.Key.StartsWith("$scenario|") } |
+			Sort-Object -Property @{ Expression = 'Value'; Descending = $true }, @{ Expression = 'Name'; Descending = $false } |
+			Select-Object -First 1
+		$result[$scenario.Substring(0, 1).ToUpperInvariant() + $scenario.Substring(1)] = [pscustomobject]@{
+			Scenario = $scenario
+			PeakRps = if ($null -eq $peak) { 0 } else { [int]$peak.Value }
+			Second = if ($null -eq $peak) { $null } else { $peak.Key.Substring($scenario.Length + 1) }
+		}
+	}
+	return [pscustomobject]$result
+}
+
+function Test-Issue57Integrity {
+	param([Parameter(Mandatory)] [object[]] $Rows)
+
+	if ($Rows.Count -ne 2) {
+		return $false
+	}
+	foreach ($scenario in @('base', 'stressed')) {
+		$matches = @($Rows | Where-Object { $_.scenario -eq $scenario })
+		if ($matches.Count -ne 1 -or [int]$matches[0].confirmed_count -ne 1) {
+			return $false
+		}
+	}
+	return $true
+}
+
+function New-Issue57JwtPem {
+	$rsa = [Security.Cryptography.RSA]::Create(2048)
+	try {
+		return [pscustomobject]@{
+			Public = $rsa.ExportSubjectPublicKeyInfoPem() -replace "`r?`n", '\n'
+			Private = $rsa.ExportPkcs8PrivateKeyPem() -replace "`r?`n", '\n'
+		}
+	} finally {
+		$rsa.Dispose()
+	}
+}
+
+function Invoke-Issue57External {
+	param(
+		[Parameter(Mandatory)] [string] $FilePath,
+		[Parameter(Mandatory)] [string[]] $Arguments
+	)
+
+	$startInfo = [Diagnostics.ProcessStartInfo]::new()
+	$startInfo.FileName = $FilePath
+	$startInfo.UseShellExecute = $false
+	$startInfo.RedirectStandardOutput = $true
+	$startInfo.RedirectStandardError = $true
+	foreach ($argument in $Arguments) {
+		[void]$startInfo.ArgumentList.Add($argument)
+	}
+	$process = [Diagnostics.Process]::new()
+	$process.StartInfo = $startInfo
+	try {
+		[void]$process.Start()
+		$stdout = $process.StandardOutput.ReadToEndAsync()
+		$stderr = $process.StandardError.ReadToEndAsync()
+		$process.WaitForExit()
+		return [pscustomobject]@{
+			ExitCode = $process.ExitCode
+			StdOut = $stdout.GetAwaiter().GetResult()
+			StdErr = $stderr.GetAwaiter().GetResult()
+		}
+	} finally {
+		$process.Dispose()
+	}
+}
+
+function Assert-Issue57Dependencies {
+	foreach ($command in @('docker', 'k6')) {
+		if ($null -eq (Get-Command $command -ErrorAction SilentlyContinue)) {
+			throw "필수 명령을 찾을 수 없습니다: $command"
+		}
+	}
+	$composeVersion = Invoke-Issue57External -FilePath 'docker' -Arguments @('compose', 'version')
+	if ($composeVersion.ExitCode -ne 0) {
+		throw "docker compose를 사용할 수 없습니다: $($composeVersion.StdErr.Trim())"
+	}
+	$dockerInfo = Invoke-Issue57External -FilePath 'docker' -Arguments @('info', '--format', '{{.ServerVersion}}')
+	if ($dockerInfo.ExitCode -ne 0) {
+		throw "Docker Engine을 사용할 수 없습니다: $($dockerInfo.StdErr.Trim())"
+	}
+	$k6Version = Invoke-Issue57External -FilePath 'k6' -Arguments @('version')
+	if ($k6Version.ExitCode -ne 0) {
+		throw "k6를 사용할 수 없습니다: $($k6Version.StdErr.Trim())"
+	}
+}
+
+function Start-Issue57Stats {
+	param(
+		[ValidateSet('Single', 'Dual')] [string] $Mode,
+		[Parameter(Mandatory)] [string] $ResultDirectory
+	)
+
+	$psResult = Invoke-Issue57External -FilePath 'docker' -Arguments (@(Get-Issue57ComposeArguments -Mode $Mode) + @('ps', '-q'))
+	if ($psResult.ExitCode -ne 0) {
+		throw "Compose 컨테이너 ID 조회 실패: $($psResult.StdErr.Trim())"
+	}
+	$containerIds = @($psResult.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+	if ($containerIds.Count -eq 0) {
+		throw 'docker stats를 수집할 현재 Compose 컨테이너가 없습니다.'
+	}
+
+	$arguments = @('stats', '--no-trunc', '--format', '{{.Container}},{{.Name}},{{.CPUPerc}},{{.MemUsage}},{{.NetIO}},{{.BlockIO}},{{.PIDs}}') + $containerIds
+	return Start-Process -FilePath 'docker' -ArgumentList $arguments -WindowStyle Hidden -RedirectStandardOutput (Join-Path $ResultDirectory 'docker-stats.csv') -RedirectStandardError (Join-Path $ResultDirectory 'docker-stats.stderr.log') -PassThru
+}
+
+function Write-Issue57PeakEvidence {
+	param(
+		[Parameter(Mandatory)] [string] $RawJsonPath,
+		[Parameter(Mandatory)] [string] $ResultDirectory
+	)
+
+	$peak = Get-Issue57PeakRps -RawJsonPath $RawJsonPath
+	$peak | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $ResultDirectory 'peak-rps.json') -Encoding utf8
+	@(
+		'# 초기 예약 요청 피크 RPS',
+		'',
+		'| 시나리오 | Peak RPS | UTC 초 |',
+		'|---|---:|---|',
+		"| Base | $($peak.Base.PeakRps) | $($peak.Base.Second) |",
+		"| Stressed | $($peak.Stressed.PeakRps) | $($peak.Stressed.Second) |"
+	) | Set-Content -LiteralPath (Join-Path $ResultDirectory 'peak-rps.md') -Encoding utf8
+	if ($peak.Base.PeakRps -le 0 -or $peak.Stressed.PeakRps -le 0) {
+		throw 'Base 또는 Stressed의 initial http_reqs 피크 RPS를 계산하지 못했습니다.'
+	}
+}
+
+function Get-Issue57IntegritySql {
+	param([Parameter(Mandatory)] $Slots)
+
+	return @"
+SELECT 'base' AS scenario, '$($Slots.Base)' AS expected_start_at,
+       count(*) FILTER (WHERE status = 'CONFIRMED') AS confirmed_count,
+       count(*) AS matching_count
+FROM reservation
+WHERE store_id = '$script:Issue57StoreId'
+  AND assigned_staff_id = '$script:Issue57StaffId'
+  AND start_at = TIMESTAMPTZ '$($Slots.Base)'
+UNION ALL
+SELECT 'stressed' AS scenario, '$($Slots.Stressed)' AS expected_start_at,
+       count(*) FILTER (WHERE status = 'CONFIRMED') AS confirmed_count,
+       count(*) AS matching_count
+FROM reservation
+WHERE store_id = '$script:Issue57StoreId'
+  AND assigned_staff_id = '$script:Issue57StaffId'
+  AND start_at = TIMESTAMPTZ '$($Slots.Stressed)';
+"@
+}
+
+function Invoke-Issue57Mode {
+	param(
+		[ValidateSet('Single', 'Dual')] [string] $Mode,
+		[Parameter(Mandatory)] $Slots
+	)
+
+	$timestamp = [DateTimeOffset]::Now.ToString('yyyyMMdd-HHmmssfff')
+	$resultDirectory = Join-Path (Join-Path $PSScriptRoot 'results') "$timestamp-$($Mode.ToLowerInvariant())"
+	[void](New-Item -ItemType Directory -Path $resultDirectory -Force)
+	$compose = @(Get-Issue57ComposeArguments -Mode $Mode)
+	$failures = [Collections.Generic.List[string]]::new()
+	$statsProcess = $null
+	$statsProcessId = $null
+	$k6ExitCode = $null
+	$cleanupExitCode = $null
+	$startedAt = [DateTimeOffset]::UtcNow
+	$logsCaptured = $false
+
+	Write-Host "[$Mode] 결과 경로: $resultDirectory"
+	try {
+		$preCleanup = Invoke-Issue57External -FilePath 'docker' -Arguments (Get-Issue57CleanupArguments -Mode $Mode)
+		$preCleanup.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'pre-cleanup.stdout.log') -Encoding utf8
+		$preCleanup.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'pre-cleanup.stderr.log') -Encoding utf8
+		if ($preCleanup.ExitCode -ne 0) {
+			[void]$failures.Add("startup cleanup exit $($preCleanup.ExitCode)")
+			throw '초기 Compose 정리에 실패했습니다.'
+		}
+
+		$up = Invoke-Issue57External -FilePath 'docker' -Arguments ($compose + @('up', '-d', '--build', '--wait', '--wait-timeout', '240'))
+		$up.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'compose-up.stdout.log') -Encoding utf8
+		$up.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'compose-up.stderr.log') -Encoding utf8
+		if ($up.ExitCode -ne 0) {
+			[void]$failures.Add("startup exit $($up.ExitCode)")
+			throw 'Compose가 240초 안에 정상 상태가 되지 못했습니다.'
+		}
+
+		$seed = Invoke-Issue57External -FilePath 'docker' -Arguments ($compose + @('exec', '-T', 'postgres', 'psql', '-v', 'ON_ERROR_STOP=1', '-U', 'jariyo', '-d', 'jariyo', '-f', '/fixtures/issue-57.sql'))
+		$seed.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'fixture.stdout.log') -Encoding utf8
+		$seed.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'fixture.stderr.log') -Encoding utf8
+		if ($seed.ExitCode -ne 0) {
+			[void]$failures.Add("seed exit $($seed.ExitCode)")
+			throw 'fixture 적용에 실패했습니다.'
+		}
+
+		$statsProcess = Start-Issue57Stats -Mode $Mode -ResultDirectory $resultDirectory
+		$statsProcessId = $statsProcess.Id
+		$rawJsonPath = Join-Path $resultDirectory 'raw.json'
+		$k6ResultDirectory = $resultDirectory.Replace('\', '/')
+		$k6 = Invoke-Issue57External -FilePath 'k6' -Arguments @(
+			'run', '--out', "json=$rawJsonPath",
+			'-e', 'BASE_URL=http://localhost:8080',
+			'-e', "BASE_START_AT=$($Slots.Base)",
+			'-e', "STRESSED_START_AT=$($Slots.Stressed)",
+			'-e', "RESULT_DIR=$k6ResultDirectory",
+			(Join-Path $PSScriptRoot 'reservation-conflict.js')
+		)
+		$k6ExitCode = $k6.ExitCode
+		$k6.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'k6.stdout.log') -Encoding utf8
+		$k6.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'k6.stderr.log') -Encoding utf8
+		if ($k6ExitCode -ne 0) {
+			[void]$failures.Add("k6 exit $k6ExitCode")
+		}
+
+		try {
+			Write-Issue57PeakEvidence -RawJsonPath $rawJsonPath -ResultDirectory $resultDirectory
+		} catch {
+			[void]$failures.Add("peak RPS analysis: $($_.Exception.Message)")
+		}
+
+		$sql = Get-Issue57IntegritySql -Slots $Slots
+		$integrity = Invoke-Issue57External -FilePath 'docker' -Arguments ($compose + @('exec', '-T', 'postgres', 'psql', '--csv', '-v', 'ON_ERROR_STOP=1', '-U', 'jariyo', '-d', 'jariyo', '-c', $sql))
+		$integrity.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'integrity.csv') -Encoding utf8
+		$integrity.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'integrity.stderr.log') -Encoding utf8
+		if ($integrity.ExitCode -ne 0) {
+			[void]$failures.Add("integrity query exit $($integrity.ExitCode)")
+		} else {
+			$rows = @($integrity.StdOut | ConvertFrom-Csv)
+			if (-not (Test-Issue57Integrity -Rows $rows)) {
+				[void]$failures.Add('integrity expected one CONFIRMED row for each slot')
+			}
+		}
+	} catch {
+		if ($failures.Count -eq 0 -or -not $failures[$failures.Count - 1].Contains($_.Exception.Message)) {
+			[void]$failures.Add($_.Exception.Message)
+		}
+	} finally {
+		$statsExitCode = $null
+		try {
+			try {
+				$logs = Invoke-Issue57External -FilePath 'docker' -Arguments ($compose + @('logs', '--no-color', '--timestamps'))
+				$logs.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'compose.log') -Encoding utf8
+				$logs.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'compose-logs.stderr.log') -Encoding utf8
+				$logsCaptured = $logs.ExitCode -eq 0
+				if (-not $logsCaptured) {
+					[void]$failures.Add("log capture exit $($logs.ExitCode)")
+				}
+				if ($Mode -eq 'Dual' -and $logsCaptured -and
+					(-not $logs.StdOut.Contains('api-1:8080') -or -not $logs.StdOut.Contains('api-2:8080'))) {
+					[void]$failures.Add('dual Nginx access logs did not contain both api-1:8080 and api-2:8080')
+				}
+			} catch {
+				[void]$failures.Add("log capture: $($_.Exception.Message)")
+			}
+
+			if ($null -ne $statsProcess) {
+				try {
+					$statsExitedBeforeStop = $statsProcess.HasExited
+					if (-not $statsExitedBeforeStop) {
+						Stop-Process -Id $statsProcess.Id
+						$statsProcess.WaitForExit()
+					}
+					$statsExitCode = $statsProcess.ExitCode
+					if ($statsExitedBeforeStop) {
+						[void]$failures.Add("stats collector exited early with code $statsExitCode")
+					}
+				} catch {
+					[void]$failures.Add("stats stop: $($_.Exception.Message)")
+				} finally {
+					$statsProcess.Dispose()
+				}
+			}
+		} finally {
+			try {
+				$cleanup = Invoke-Issue57External -FilePath 'docker' -Arguments (Get-Issue57CleanupArguments -Mode $Mode)
+				$cleanupExitCode = $cleanup.ExitCode
+				$cleanup.StdOut | Set-Content -LiteralPath (Join-Path $resultDirectory 'cleanup.stdout.log') -Encoding utf8
+				$cleanup.StdErr | Set-Content -LiteralPath (Join-Path $resultDirectory 'cleanup.stderr.log') -Encoding utf8
+				if ($cleanupExitCode -ne 0) {
+					[void]$failures.Add("cleanup exit $cleanupExitCode")
+				}
+			} catch {
+				[void]$failures.Add("cleanup: $($_.Exception.Message)")
+			}
+		}
+
+		[ordered]@{
+			mode = $Mode
+			composeProject = $script:Issue57ProjectName
+			startedAt = $startedAt.ToString('o')
+			finishedAt = [DateTimeOffset]::UtcNow.ToString('o')
+			baseStartAt = $Slots.Base
+			stressedStartAt = $Slots.Stressed
+			k6ExitCode = $k6ExitCode
+			statsProcessId = $statsProcessId
+			statsExitCode = $statsExitCode
+			logsCaptured = $logsCaptured
+			cleanupExitCode = $cleanupExitCode
+			success = $failures.Count -eq 0
+			failures = @($failures)
+		} | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $resultDirectory 'run-metadata.json') -Encoding utf8
+	}
+
+	if ($failures.Count -gt 0) {
+		Write-Error "[$Mode] 실패: $($failures -join '; ')" -ErrorAction Continue
+		return $false
+	}
+	Write-Host "[$Mode] 성공"
+	return $true
+}
+
+function Invoke-Issue57Run {
+	param([ValidateSet('Single', 'Dual', 'All')] [string] $Mode = 'All')
+
+	Assert-Issue57Dependencies
+	$environmentNames = @('JWT_ISSUER', 'JWT_AUDIENCE', 'JWT_PUBLIC_KEY', 'JWT_PRIVATE_KEY', 'POSTGRES_DB', 'POSTGRES_USER', 'POSTGRES_PASSWORD')
+	$environment = @{}
+	foreach ($name in $environmentNames) {
+		$environment[$name] = [pscustomobject]@{
+			Exists = Test-Path -LiteralPath "Env:$name"
+			Value = [Environment]::GetEnvironmentVariable($name, 'Process')
+		}
+	}
+
+	try {
+		$pem = New-Issue57JwtPem
+		$env:JWT_ISSUER = 'https://api.jariyo.local'
+		$env:JWT_AUDIENCE = 'jariyo-web'
+		$env:JWT_PUBLIC_KEY = $pem.Public
+		$env:JWT_PRIVATE_KEY = $pem.Private
+		$env:POSTGRES_DB = 'jariyo'
+		$env:POSTGRES_USER = 'jariyo'
+		$env:POSTGRES_PASSWORD = 'jariyo'
+
+		$slots = Get-Issue57Slots
+		$modes = if ($Mode -eq 'All') { @('Single', 'Dual') } else { @($Mode) }
+		$success = $true
+		foreach ($selectedMode in $modes) {
+			if (-not (Invoke-Issue57Mode -Mode $selectedMode -Slots $slots)) {
+				$success = $false
+			}
+		}
+		return $(if ($success) { 0 } else { 1 })
+	} finally {
+		$pem = $null
+		foreach ($name in $environmentNames) {
+			if ($environment[$name].Exists) {
+				[Environment]::SetEnvironmentVariable($name, $environment[$name].Value, 'Process')
+			} else {
+				[Environment]::SetEnvironmentVariable($name, $null, 'Process')
+			}
+		}
+	}
+}
+
+if ($MyInvocation.InvocationName -ne '.') {
+	try {
+		exit (Invoke-Issue57Run -Mode $Mode)
+	} catch {
+		Write-Error $_.Exception.Message
+		exit 1
+	}
+}
