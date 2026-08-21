@@ -59,7 +59,7 @@ Stressed의 initial `201` 이외 응답은 1초 뒤 같은 `Idempotency-Key`로 
 
 - Compose 시작, fixture 적용, k6 임계값, raw JSON 피크 분석 성공
 - Base와 Stressed의 정확한 매장·직원·시각에 `CONFIRMED` 예약이 각각 정확히 1건
-- Dual일 때 Nginx access log에 `api-1:8080`, `api-2:8080`이 모두 존재
+- Dual일 때 scoped Compose로 찾은 `api-1`/`api-2` 컨테이너의 프로젝트 네트워크 `IP:8080`이 Nginx access log에 모두 존재
 - 로그·증거 수집과 해당 Compose 프로젝트 정리 성공
 
 k6 임계값이 실패해도 무결성 조회와 로그 수집은 계속하며, 마지막 프로세스 종료 코드는 실패로 유지된다.
@@ -73,6 +73,7 @@ summary.json / summary.md       k6 요약과 threshold 판정
 raw.json                       k6 line-delimited raw metric
 peak-rps.json / peak-rps.md    initial 요청만 집계한 Base/Stressed 초당 피크
 integrity.csv                  정확한 두 슬롯의 DB 무결성 증거
+dual-upstreams.json            Dual 서비스별 container ID·project-network IP 증거
 docker-stats.csv               현재 프로젝트 컨테이너 ID만 수집한 자원 표본
 compose.log                    Nginx/API/PostgreSQL 로그
 k6.*.log                       k6 표준 출력·오류
@@ -87,6 +88,6 @@ run-metadata.json              모드, 슬롯, 종료 코드, 실패 사유
 
 ## 정리 범위와 해석 주의
 
-러너는 전역 Docker prune이나 다른 프로젝트의 컨테이너·볼륨 삭제를 하지 않는다. 시작 전과 `finally`에서 Compose 파일과 명시적 프로젝트명 `jariyo-issue-57`을 사용한 `down -v --remove-orphans`만 실행하며, stats 수집도 해당 프로젝트의 현재 컨테이너 ID와 시작한 PID로 제한한다.
+러너는 전역 Docker prune이나 다른 프로젝트의 컨테이너·볼륨 삭제를 하지 않는다. 시작 전과 `finally`에서 Compose 파일과 명시적 프로젝트명 `jariyo-issue-57`을 사용한 `down -v --remove-orphans`만 실행한다. stats 수집은 해당 프로젝트의 현재 컨테이너 ID로 제한하고, 종료할 때도 보관한 Process 객체의 `Kill()`과 제한 시간 대기만 사용한다.
 
 이 환경은 Fargate/RDS 배치의 동시성·경합 양상을 재현하기 위한 근사치다. Docker Desktop의 VM, 호스트 자원, 파일 시스템과 네트워크 특성이 AWS와 다르므로 절대 성능 수치를 Fargate/RDS 성능과 동일하게 해석하면 안 된다.

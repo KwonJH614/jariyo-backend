@@ -96,6 +96,31 @@ function Test-Issue57Integrity {
 	return $true
 }
 
+function Test-Issue57DualDistribution {
+	param(
+		[Parameter(Mandatory)] [string] $NginxLog,
+		[Parameter(Mandatory)] [object[]] $Services
+	)
+
+	$upstreams = @()
+	foreach ($service in @('api-1', 'api-2')) {
+		$matches = @($Services | Where-Object { $_.service -eq $service })
+		if ($matches.Count -ne 1 -or [string]::IsNullOrWhiteSpace($matches[0].upstream)) {
+			return $false
+		}
+		$upstreams += [string]$matches[0].upstream
+	}
+	if (@($upstreams | Select-Object -Unique).Count -ne 2) {
+		return $false
+	}
+	foreach ($upstream in $upstreams) {
+		if ($NginxLog -notmatch "(?m)(?:^|\s)upstream=$([regex]::Escape($upstream))(?=\s|$)") {
+			return $false
+		}
+	}
+	return $true
+}
+
 function New-Issue57JwtPem {
 	$rsa = [Security.Cryptography.RSA]::Create(2048)
 	try {
@@ -157,6 +182,44 @@ function Assert-Issue57Dependencies {
 	if ($k6Version.ExitCode -ne 0) {
 		throw "k6를 사용할 수 없습니다: $($k6Version.StdErr.Trim())"
 	}
+}
+
+function Get-Issue57DualServices {
+	param([Parameter(Mandatory)] [string[]] $ComposeArguments)
+
+	$networkName = "$($script:Issue57ProjectName)_default"
+	$result = @()
+	foreach ($service in @('api-1', 'api-2')) {
+		$container = Invoke-Issue57External -FilePath 'docker' -Arguments ($ComposeArguments + @('ps', '-q', $service))
+		$containerIds = @($container.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+		if ($container.ExitCode -ne 0 -or $containerIds.Count -ne 1 -or $containerIds[0] -notmatch '^[a-f0-9]{12,64}$') {
+			throw "Compose 서비스 $service 컨테이너 ID를 정확히 하나 확인하지 못했습니다."
+		}
+
+		$template = '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.service"}}|{{json .NetworkSettings.Networks}}'
+		$inspection = Invoke-Issue57External -FilePath 'docker' -Arguments @('inspect', '--format', $template, $containerIds[0])
+		$parts = @($inspection.StdOut.Trim() -split '\|', 3)
+		if ($inspection.ExitCode -ne 0 -or $parts.Count -ne 3 -or
+			$parts[0] -ne $script:Issue57ProjectName -or $parts[1] -ne $service) {
+			throw "Compose 서비스 $service 컨테이너 label 검증에 실패했습니다."
+		}
+		$networks = $parts[2] | ConvertFrom-Json
+		$network = @($networks.PSObject.Properties | Where-Object { $_.Name -eq $networkName })
+		$parsedIp = $null
+		$ip = if ($network.Count -eq 1) { [string]$network[0].Value.IPAddress } else { '' }
+		if (-not [Net.IPAddress]::TryParse($ip, [ref]$parsedIp) -or
+			$parsedIp.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) {
+			throw "Compose 서비스 $service 프로젝트 네트워크 IPv4를 확인하지 못했습니다."
+		}
+		$result += [pscustomobject]@{
+			service = $service
+			containerId = $containerIds[0]
+			network = $networkName
+			ip = $ip
+			upstream = "${ip}:8080"
+		}
+	}
+	return $result
 }
 
 function Start-Issue57Stats {
@@ -234,6 +297,7 @@ function Invoke-Issue57Mode {
 	$failures = [Collections.Generic.List[string]]::new()
 	$statsProcess = $null
 	$statsProcessId = $null
+	$dualServices = @()
 	$k6ExitCode = $null
 	$cleanupExitCode = $null
 	$startedAt = [DateTimeOffset]::UtcNow
@@ -263,6 +327,10 @@ function Invoke-Issue57Mode {
 		if ($seed.ExitCode -ne 0) {
 			[void]$failures.Add("seed exit $($seed.ExitCode)")
 			throw 'fixture 적용에 실패했습니다.'
+		}
+		if ($Mode -eq 'Dual') {
+			$dualServices = @(Get-Issue57DualServices -ComposeArguments $compose)
+			$dualServices | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Join-Path $resultDirectory 'dual-upstreams.json') -Encoding utf8
 		}
 
 		$statsProcess = Start-Issue57Stats -Mode $Mode -ResultDirectory $resultDirectory
@@ -318,8 +386,8 @@ function Invoke-Issue57Mode {
 					[void]$failures.Add("log capture exit $($logs.ExitCode)")
 				}
 				if ($Mode -eq 'Dual' -and $logsCaptured -and
-					(-not $logs.StdOut.Contains('api-1:8080') -or -not $logs.StdOut.Contains('api-2:8080'))) {
-					[void]$failures.Add('dual Nginx access logs did not contain both api-1:8080 and api-2:8080')
+					-not (Test-Issue57DualDistribution -NginxLog $logs.StdOut -Services $dualServices)) {
+					[void]$failures.Add('dual Nginx access logs did not contain both resolved API upstream addresses')
 				}
 			} catch {
 				[void]$failures.Add("log capture: $($_.Exception.Message)")
@@ -329,10 +397,14 @@ function Invoke-Issue57Mode {
 				try {
 					$statsExitedBeforeStop = $statsProcess.HasExited
 					if (-not $statsExitedBeforeStop) {
-						Stop-Process -Id $statsProcess.Id
-						$statsProcess.WaitForExit()
+						$statsProcess.Kill()
+						if (-not $statsProcess.WaitForExit(5000)) {
+							[void]$failures.Add('stats collector did not exit within 5 seconds')
+						}
 					}
-					$statsExitCode = $statsProcess.ExitCode
+					if ($statsProcess.HasExited) {
+						$statsExitCode = $statsProcess.ExitCode
+					}
 					if ($statsExitedBeforeStop) {
 						[void]$failures.Add("stats collector exited early with code $statsExitCode")
 					}

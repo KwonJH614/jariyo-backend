@@ -32,8 +32,8 @@
 - 고정 `+09:00` 기준 이틀 뒤 14:00/15:00을 각각 Base/Stressed로 전달한다.
 - k6는 `http://localhost:8080`만 호출하며 raw JSON과 요약을 결과 디렉터리에 쓴다.
 - k6 threshold exit가 0이 아니어도 피크 RPS, 무결성, 로그를 계속 수집하고 전체 종료 코드는 실패로 유지한다.
-- Base/Stressed의 exact store/staff/instant에 `CONFIRMED`가 각각 1건이 아니거나 Dual access log에 두 upstream이 모두 없으면 실패한다.
-- stats는 현재 Compose 프로젝트의 `ps -q` 결과만 대상으로 하고, 러너가 시작한 PID만 중지한다.
+- Base/Stressed의 exact store/staff/instant에 `CONFIRMED`가 각각 1건이 아니거나 Dual access log에 scoped Compose로 확인한 두 API의 runtime `IP:8080`이 모두 없으면 실패한다.
+- stats는 현재 Compose 프로젝트의 `ps -q` 결과만 대상으로 하고, 종료도 보관한 Process 객체에만 요청한다.
 
 ## 실행 명령
 
@@ -115,7 +115,7 @@ Compose config 중 sandbox 사용자의 `C:\Users\madog\.docker\config.json` 접
 - `docker`, Compose, Docker Engine, local k6를 확인한 뒤에만 환경값·결과 디렉터리를 변경한다.
 - cleanup 인자는 Compose 파일, `--project-name jariyo-issue-57`, `down -v --remove-orphans`로 고정했다.
 - 전역 prune, 다른 컨테이너·볼륨 제거, 이름 또는 glob 기반 광역 Stop/Remove 명령이 없다.
-- stats 대상은 이 프로젝트의 현재 container ID 목록이며 중지는 보관한 단일 PID에만 적용한다.
+- stats 대상은 이 프로젝트의 현재 container ID 목록이며 중지는 보관한 단일 Process 객체의 `Kill()`과 5초 제한 대기로만 수행한다.
 - 로그 수집 또는 stats 중지 예외가 나도 중첩 `finally`에서 cleanup을 시도한다.
 - cleanup 실패 자체를 결과 metadata와 비정상 종료에 반영한다.
 - JWT와 명시적으로 고정한 PostgreSQL 환경값은 존재 여부와 기존 값을 보관해 최외곽 `finally`에서 복원한다.
@@ -130,3 +130,22 @@ Compose config 중 sandbox 사용자의 `C:\Users\madog\.docker\config.json` 접
 - 실제 컨테이너 기동과 부하는 실행하지 않았다.
 - 최종 repository WK report를 만들지 않았다.
 - 남은 위험과 Task 4 후속 검증을 `이슈`, `후속 작업`에 기록했다.
+
+## 리뷰 수정 1차
+
+- 원 Task 3 커밋 SHA: `e57a5e34b10491fba29a6debaaa92de4056db544`
+- 기존 Dual 판정은 Nginx `$upstream_addr`가 Compose 서비스명 `api-1:8080`/`api-2:8080`을 기록한다고 잘못 가정했다. 실제 계약에 맞게 scoped `docker compose ... ps -q <service>`로 각 컨테이너 ID를 얻고, `docker inspect`의 Compose project/service label을 재검증한 뒤 `jariyo-issue-57_default` 네트워크 IPv4를 선택한다.
+- 서비스, container ID, network, IP, `IP:8080`을 `dual-upstreams.json`에 보존하고 두 resolved upstream 값이 모두 Nginx access log의 `upstream=` 필드에 있을 때만 Dual 분배를 통과시킨다.
+- stats 종료는 PID 재조회 방식의 `Stop-Process`를 제거하고, 시작 시 받은 Process 객체의 `Kill()`과 `WaitForExit(5000)`만 사용한다. 다른 프로세스를 이름 또는 PID로 다시 찾지 않는다.
+
+### 리뷰 수정 RED/GREEN 및 검증
+
+- RED: exit 1, `runner function is missing: Test-Issue57DualDistribution`
+- GREEN: exit 0, `PASS: 7 focused runner behavior groups`
+- representative resolved-IP 두 upstream 로그: 통과
+- resolved-IP 하나가 빠진 로그: 의도대로 실패 판정
+- PowerShell parser: exit 0, `PASS: PowerShell parser validation (0 errors)`
+- base/dual Compose config: exit 0, `PASS: Compose config base=0 dual=0`
+- stats 정적 안전 검증: exit 0, `PASS: stats shutdown does not use Stop-Process`
+- Gradle 전체 테스트: exit 0, `BUILD SUCCESSFUL in 2s`, `4 actionable tasks: 4 up-to-date`
+- Compose config에서 sandbox 사용자의 Docker 설정 파일 접근 warning만 발생했고 컨테이너는 시작하지 않았다.

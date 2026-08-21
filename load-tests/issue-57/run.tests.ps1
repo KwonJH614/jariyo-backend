@@ -26,6 +26,7 @@ $requiredFunctions = @(
 	'Get-Issue57Slots',
 	'Get-Issue57PeakRps',
 	'Test-Issue57Integrity',
+	'Test-Issue57DualDistribution',
 	'Get-Issue57CleanupArguments',
 	'New-Issue57JwtPem'
 )
@@ -75,6 +76,18 @@ Assert-True (-not (Test-Issue57Integrity -Rows @($validRows[0]))) 'a missing slo
 $invalidRows = @($validRows[0], [pscustomobject]@{ scenario = 'stressed'; confirmed_count = '2' })
 Assert-True (-not (Test-Issue57Integrity -Rows $invalidRows)) 'more than one confirmed row must fail integrity'
 
+$dualServices = @(
+	[pscustomobject]@{ service = 'api-1'; upstream = '172.29.0.3:8080' },
+	[pscustomobject]@{ service = 'api-2'; upstream = '172.29.0.4:8080' }
+)
+$distributedLog = @'
+nginx-1 | request upstream=172.29.0.3:8080 status=201
+nginx-1 | request upstream=172.29.0.4:8080 status=409
+'@
+Assert-True (Test-Issue57DualDistribution -NginxLog $distributedLog -Services $dualServices) 'resolved upstream IPs for both API services must pass'
+$oneUpstreamLog = 'nginx-1 | request upstream=172.29.0.3:8080 status=201'
+Assert-True (-not (Test-Issue57DualDistribution -NginxLog $oneUpstreamLog -Services $dualServices)) 'a missing resolved upstream IP must fail distribution'
+
 $cleanup = @(Get-Issue57CleanupArguments -Mode Dual)
 $projectIndex = [Array]::IndexOf($cleanup, '--project-name')
 Assert-True ($projectIndex -ge 0) 'cleanup must set an explicit Compose project'
@@ -92,4 +105,4 @@ Assert-True (-not $pem.Public.Contains("`n")) 'public PEM must not contain real 
 Assert-True (-not $pem.Private.Contains("`n")) 'private PEM must not contain real newlines'
 Assert-True (-not $pem.Public.Contains('PRIVATE KEY')) 'public material must not contain private key data'
 
-Write-Output 'PASS: 6 focused runner behavior groups'
+Write-Output 'PASS: 7 focused runner behavior groups'
