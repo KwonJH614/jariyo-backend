@@ -58,7 +58,8 @@ Stressed의 initial `201` 이외 응답은 1초 뒤 같은 `Idempotency-Key`로 
 종료 코드 0은 다음 조건을 모두 만족했다는 뜻이다.
 
 - Compose 시작, fixture 적용, k6 임계값, raw JSON 피크 분석 성공
-- Base와 Stressed의 정확한 매장·직원·시각에 `CONFIRMED` 예약이 각각 정확히 1건
+- initial 예약 호출 직전에 기록한 dispatch 기준 피크가 Base 10~20 RPS, Stressed 50~100 RPS 범위
+- Base와 Stressed의 정확한 매장·직원·시각에 전체 예약 행과 `CONFIRMED` 예약이 각각 정확히 1건
 - Dual일 때 scoped Compose로 찾은 `api-1`/`api-2` 컨테이너의 프로젝트 네트워크 `IP:8080`이 Nginx access log에 모두 존재
 - 로그·증거 수집과 해당 Compose 프로젝트 정리 성공
 
@@ -71,7 +72,7 @@ k6 임계값이 실패해도 무결성 조회와 로그 수집은 계속하며, 
 ```text
 summary.json / summary.md       k6 요약과 threshold 판정
 raw.json                       k6 line-delimited raw metric
-peak-rps.json / peak-rps.md    initial 요청만 집계한 Base/Stressed 초당 피크
+peak-rps.json / peak-rps.md    initial 호출 직전 dispatch Counter로 집계한 초당 피크
 integrity.csv                  정확한 두 슬롯의 DB 무결성 증거
 dual-upstreams.json            Dual 서비스별 container ID·project-network IP 증거
 docker-stats.csv               현재 프로젝트 컨테이너 ID만 수집한 자원 표본

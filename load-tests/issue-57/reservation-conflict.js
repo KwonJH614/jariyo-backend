@@ -25,6 +25,7 @@ const JSON_HEADERS = { 'Content-Type': 'application/json' };
 const expectedReservationStatuses = http.expectedStatuses(201, 409);
 
 const setupFailures = new Counter('setup_failures');
+const reservationInitialStarted = new Counter('reservation_initial_started');
 const reservationSuccess = new Counter('reservation_success');
 const reservationConflict = new Counter('reservation_conflict');
 const reservation5xx = new Rate('reservation_5xx');
@@ -123,6 +124,9 @@ function reserve(tokens, scenario, startAt, retryNon201) {
 
 function reservationRequest(token, key, body, scenario, attempt) {
 	const tags = { scenario, attempt };
+	if (attempt === 'initial') {
+		reservationInitialStarted.add(1, tags);
+	}
 	const response = http.post(`${BASE_URL}/api/v1/reservations`, body, {
 		headers: {
 			...JSON_HEADERS,

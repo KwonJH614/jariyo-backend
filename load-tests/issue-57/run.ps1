@@ -56,12 +56,12 @@ function Get-Issue57PeakRps {
 		}
 		$point = $_ | ConvertFrom-Json
 		if ($point.type -ne 'Point' -or
-			$point.metric -ne 'http_reqs' -or
+			$point.metric -ne 'reservation_initial_started' -or
 			$point.data.tags.attempt -ne 'initial' -or
 			$point.data.tags.scenario -notin @('base', 'stressed')) {
 			return
 		}
-		$second = ([DateTimeOffset]::Parse($point.data.time)).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+		$second = ConvertTo-Issue57UtcSecond -Value $point.data.time
 		$key = "$($point.data.tags.scenario)|$second"
 		$buckets[$key] = [double]($buckets[$key] ?? 0) + [double]$point.data.value
 	}
@@ -81,6 +81,40 @@ function Get-Issue57PeakRps {
 	return [pscustomobject]$result
 }
 
+function ConvertTo-Issue57UtcSecond {
+	param([Parameter(Mandatory)] $Value)
+
+	if ($Value -is [DateTimeOffset]) {
+		$instant = $Value
+	} elseif ($Value -is [DateTime]) {
+		$dateTime = [DateTime]$Value
+		if ($dateTime.Kind -eq [DateTimeKind]::Unspecified) {
+			$dateTime = [DateTime]::SpecifyKind($dateTime, [DateTimeKind]::Utc)
+		}
+		$instant = [DateTimeOffset]::new($dateTime)
+	} elseif ($Value -is [string]) {
+		$instant = [DateTimeOffset]::Parse(
+			[string]$Value,
+			[Globalization.CultureInfo]::InvariantCulture,
+			[Globalization.DateTimeStyles]::AllowWhiteSpaces
+		)
+	} else {
+		throw "지원하지 않는 k6 timestamp 타입입니다: $($Value.GetType().FullName)"
+	}
+
+	return $instant.ToUniversalTime().ToString(
+		"yyyy-MM-dd'T'HH:mm:ss'Z'",
+		[Globalization.CultureInfo]::InvariantCulture
+	)
+}
+
+function Test-Issue57PeakRpsRange {
+	param([Parameter(Mandatory)] $Peak)
+
+	return $Peak.Base.PeakRps -ge 10 -and $Peak.Base.PeakRps -le 20 -and
+		$Peak.Stressed.PeakRps -ge 50 -and $Peak.Stressed.PeakRps -le 100
+}
+
 function Test-Issue57Integrity {
 	param([Parameter(Mandatory)] [object[]] $Rows)
 
@@ -89,7 +123,9 @@ function Test-Issue57Integrity {
 	}
 	foreach ($scenario in @('base', 'stressed')) {
 		$matches = @($Rows | Where-Object { $_.scenario -eq $scenario })
-		if ($matches.Count -ne 1 -or [int]$matches[0].confirmed_count -ne 1) {
+		if ($matches.Count -ne 1 -or
+			[int]$matches[0].confirmed_count -ne 1 -or
+			[int]$matches[0].matching_count -ne 1) {
 			return $false
 		}
 	}
@@ -257,8 +293,8 @@ function Write-Issue57PeakEvidence {
 		"| Base | $($peak.Base.PeakRps) | $($peak.Base.Second) |",
 		"| Stressed | $($peak.Stressed.PeakRps) | $($peak.Stressed.Second) |"
 	) | Set-Content -LiteralPath (Join-Path $ResultDirectory 'peak-rps.md') -Encoding utf8
-	if ($peak.Base.PeakRps -le 0 -or $peak.Stressed.PeakRps -le 0) {
-		throw 'Base 또는 Stressed의 initial http_reqs 피크 RPS를 계산하지 못했습니다.'
+	if (-not (Test-Issue57PeakRpsRange -Peak $peak)) {
+		throw "초기 예약 dispatch 피크 RPS가 범위를 벗어났습니다: Base $($peak.Base.PeakRps) (10~20), Stressed $($peak.Stressed.PeakRps) (50~100)"
 	}
 }
 
@@ -367,7 +403,7 @@ function Invoke-Issue57Mode {
 		} else {
 			$rows = @($integrity.StdOut | ConvertFrom-Csv)
 			if (-not (Test-Issue57Integrity -Rows $rows)) {
-				[void]$failures.Add('integrity expected one CONFIRMED row for each slot')
+				[void]$failures.Add('integrity expected exactly one matching CONFIRMED row for each slot')
 			}
 		}
 	} catch {

@@ -25,6 +25,8 @@ $requiredFunctions = @(
 	'Get-Issue57ComposeFiles',
 	'Get-Issue57Slots',
 	'Get-Issue57PeakRps',
+	'ConvertTo-Issue57UtcSecond',
+	'Test-Issue57PeakRpsRange',
 	'Test-Issue57Integrity',
 	'Test-Issue57DualDistribution',
 	'Get-Issue57CleanupArguments',
@@ -47,34 +49,53 @@ $slots = Get-Issue57Slots -Now $now
 Assert-Equal '2026-08-24T14:00:00+09:00' $slots.Base 'Base must be 14:00 two KST calendar days ahead'
 Assert-Equal '2026-08-24T15:00:00+09:00' $slots.Stressed 'Stressed must be 15:00 two KST calendar days ahead'
 Assert-True ($slots.Base -ne $slots.Stressed) 'Base and Stressed slots must be distinct'
+Assert-Equal '2026-08-24T05:00:00Z' (ConvertTo-Issue57UtcSecond -Value ([DateTimeOffset]::Parse('2026-08-24T14:00:00.900+09:00'))) 'DateTimeOffset must preserve its instant'
+Assert-Equal '2026-08-24T05:00:00Z' (ConvertTo-Issue57UtcSecond -Value '2026-08-24T14:00:00.900+09:00') 'string timestamp must preserve its explicit offset'
 
 $rawPath = [IO.Path]::GetTempFileName()
 try {
-	@(
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T05:00:00.100Z","value":1,"tags":{"scenario":"base","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T05:00:00.900Z","value":1,"tags":{"scenario":"base","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T05:00:01.000Z","value":1,"tags":{"scenario":"base","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T05:00:00.500Z","value":50,"tags":{"phase":"setup"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T06:00:00.100Z","value":1,"tags":{"scenario":"stressed","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T06:00:00.200Z","value":1,"tags":{"scenario":"stressed","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T06:00:00.300Z","value":1,"tags":{"scenario":"stressed","attempt":"initial"}}}',
-		'{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T06:00:00.400Z","value":99,"tags":{"scenario":"stressed","attempt":"retry"}}}'
-	) | Set-Content -LiteralPath $rawPath -Encoding utf8
+	$rawLines = [Collections.Generic.List[string]]::new()
+	foreach ($millisecond in 1..10) {
+		$time = "2026-08-24T05:00:00.$($millisecond.ToString('000'))Z"
+		[void]$rawLines.Add("{`"type`":`"Point`",`"metric`":`"reservation_initial_started`",`"data`":{`"time`":`"$time`",`"value`":1,`"tags`":{`"scenario`":`"base`",`"attempt`":`"initial`"}}}")
+	}
+	foreach ($millisecond in 1..50) {
+		$time = "2026-08-24T06:00:00.$($millisecond.ToString('000'))Z"
+		[void]$rawLines.Add("{`"type`":`"Point`",`"metric`":`"reservation_initial_started`",`"data`":{`"time`":`"$time`",`"value`":1,`"tags`":{`"scenario`":`"stressed`",`"attempt`":`"initial`"}}}")
+	}
+	[void]$rawLines.Add('{"type":"Point","metric":"reservation_initial_started","data":{"time":"2026-08-24T05:00:01.000Z","value":1,"tags":{"scenario":"base","attempt":"initial"}}}')
+	[void]$rawLines.Add('{"type":"Point","metric":"http_reqs","data":{"time":"2026-08-24T05:00:00.500Z","value":1,"tags":{"scenario":"base","attempt":"initial"}}}')
+	[void]$rawLines.Add('{"type":"Point","metric":"reservation_initial_started","data":{"time":"2026-08-24T06:00:00.400Z","value":1,"tags":{"scenario":"stressed","attempt":"retry"}}}')
+	$rawLines | Set-Content -LiteralPath $rawPath -Encoding utf8
 	$peak = Get-Issue57PeakRps -RawJsonPath $rawPath
-	Assert-Equal 2 $peak.Base.PeakRps 'Base peak RPS must group initial requests by second'
-	Assert-Equal 3 $peak.Stressed.PeakRps 'Stressed peak RPS must exclude retry requests'
+	Assert-Equal 10 $peak.Base.PeakRps 'Base peak RPS must use initial dispatch points instead of completed http requests'
+	Assert-Equal 50 $peak.Stressed.PeakRps 'Stressed peak RPS must exclude retry requests'
+	Assert-Equal '2026-08-24T05:00:00Z' $peak.Base.Second 'Base peak second must preserve the original UTC instant'
+	Assert-Equal '2026-08-24T06:00:00Z' $peak.Stressed.Second 'Stressed peak second must preserve the original UTC instant'
+	Assert-True (Test-Issue57PeakRpsRange -Peak $peak) 'Base 10~20 and Stressed 50~100 must pass the dispatch range'
+	$peak.Base.PeakRps = 9
+	Assert-True (-not (Test-Issue57PeakRpsRange -Peak $peak)) 'Base below 10 must fail the dispatch range'
+	$peak.Base.PeakRps = 21
+	Assert-True (-not (Test-Issue57PeakRpsRange -Peak $peak)) 'Base above 20 must fail the dispatch range'
+	$peak.Base.PeakRps = 10
+	$peak.Stressed.PeakRps = 49
+	Assert-True (-not (Test-Issue57PeakRpsRange -Peak $peak)) 'Stressed below 50 must fail the dispatch range'
+	$peak.Stressed.PeakRps = 101
+	Assert-True (-not (Test-Issue57PeakRpsRange -Peak $peak)) 'Stressed above 100 must fail the dispatch range'
 } finally {
 	Remove-Item -LiteralPath $rawPath -Force
 }
 
 $validRows = @(
-	[pscustomobject]@{ scenario = 'base'; confirmed_count = '1' },
-	[pscustomobject]@{ scenario = 'stressed'; confirmed_count = '1' }
+	[pscustomobject]@{ scenario = 'base'; confirmed_count = '1'; matching_count = '1' },
+	[pscustomobject]@{ scenario = 'stressed'; confirmed_count = '1'; matching_count = '1' }
 )
 Assert-True (Test-Issue57Integrity -Rows $validRows) 'one confirmed row for both slots must pass'
 Assert-True (-not (Test-Issue57Integrity -Rows @($validRows[0]))) 'a missing slot must fail integrity'
-$invalidRows = @($validRows[0], [pscustomobject]@{ scenario = 'stressed'; confirmed_count = '2' })
+$invalidRows = @($validRows[0], [pscustomobject]@{ scenario = 'stressed'; confirmed_count = '2'; matching_count = '2' })
 Assert-True (-not (Test-Issue57Integrity -Rows $invalidRows)) 'more than one confirmed row must fail integrity'
+$extraRow = @($validRows[0], [pscustomobject]@{ scenario = 'stressed'; confirmed_count = '1'; matching_count = '2' })
+Assert-True (-not (Test-Issue57Integrity -Rows $extraRow)) 'an extra non-confirmed matching reservation must fail integrity'
 
 $dualServices = @(
 	[pscustomobject]@{ service = 'api-1'; upstream = '172.29.0.3:8080' },
