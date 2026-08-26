@@ -26,6 +26,12 @@ out/
 !**/src/main/**/out/
 !**/src/test/**/out/
 
+### Issue #57 load-test runtime artifacts ###
+/load-tests/issue-57/keys/
+/load-tests/issue-57/logs/
+/load-tests/issue-57/results/
+/load-tests/issue-57/volumes/
+
 ### NetBeans ###
 /nbproject/private/
 /nbbuild/
