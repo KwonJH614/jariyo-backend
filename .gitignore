@@ -32,6 +32,12 @@ out/
 /load-tests/issue-57/results/
 /load-tests/issue-57/volumes/
 
+### Issue #56 load-test runtime artifacts ###
+/load-tests/issue-56/keys/
+/load-tests/issue-56/logs/
+/load-tests/issue-56/results/
+/load-tests/issue-56/volumes/
+
 ### NetBeans ###
 /nbproject/private/
 /nbbuild/
